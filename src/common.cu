@@ -11,6 +11,14 @@
 #include <libgen.h>
 #include "cuda.h"
 
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <ctype.h>
+
 int test_ncclVersion = 0; // init'd with ncclGetVersion()
 
 #if NCCL_MAJOR >= 2
@@ -996,8 +1004,71 @@ int main(int argc, char* argv[]) {
   return 0;
 }
 
+char *trim(char *s) {
+    char *ptr;
+    if (!s)
+        return NULL;   // handle NULL string
+    if (!*s)
+        return s;      // handle empty string
+    for (ptr = s + strlen(s) - 1; (ptr >= s) && isspace(*ptr); --ptr);
+    ptr[1] = '\0';
+    return s;
+}
+
+const char *get_ifname() {
+    const char* ifname = getenv("NCCL_SOCKET_IFNAME");
+    return ifname ? ifname : "lo";
+}
+
+void get_ip_addr(char* ip_address) {
+    int n;
+    struct ifreq ifr;
+    const char* ifname = get_ifname();
+    printf("interface name = %s\n", ifname);
+    n = socket(AF_INET, SOCK_DGRAM, 0);
+    //Type of address to retrieve - IPv4 IP address
+    ifr.ifr_addr.sa_family = AF_INET;
+    //Copy the interface name in the ifreq structure
+    strncpy(ifr.ifr_name , ifname , IFNAMSIZ - 1);
+    ioctl(n, SIOCGIFADDR, &ifr);
+    close(n);
+    strcpy(ip_address, inet_ntoa(((struct sockaddr_in*)&ifr.ifr_addr)->sin_addr));
+}
+
+void set_process(int* nnodes, int* node_rank) {
+  int nProcs = 0, proc = -1;
+  char ip_address[15];
+  FILE * fp;
+  char * line = NULL;
+  size_t len = 0;
+  ssize_t read;
+
+  get_ip_addr(ip_address);
+
+  fp = fopen("hosts", "r");
+  if (fp == NULL) {
+    printf("file `hosts` is needed");
+    exit(EXIT_FAILURE);
+  }
+
+  while ((read = getline(&line, &len, fp)) != -1) {
+    if (line[0] == '#')
+      continue;
+    if (strcmp(trim(line), ip_address) == 0)
+      proc = nProcs;
+    nProcs++;
+  }
+  *nnodes = nProcs;
+  *node_rank = proc;
+  fclose(fp);
+  if (line)
+    free(line);
+}
+
 testResult_t run() {
-  int nProcs = 1, proc = 0;
+  int nProcs, proc;
+  set_process(&nProcs, &proc);
+
   int localRank = 0;
   char hostname[1024];
   getHostName(hostname, 1024);
