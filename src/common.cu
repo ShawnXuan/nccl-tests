@@ -1069,7 +1069,7 @@ testResult_t run() {
   set_process(&nProcs, &proc);
   printf("# nProcs: %d, proc: %d\n", nProcs, proc);
   if(proc < 0) {
-    printf("This node is out of hosts");
+    printf("This node is out of hosts\n");
     exit(EXIT_SUCCESS);
   }
 
@@ -1118,6 +1118,7 @@ testResult_t run() {
     fclose(file);
   } else {
     int c = 0;
+    sleep(10);
     while (access("ncclid", R_OK)){
       ++c;
       if(c > 60)
