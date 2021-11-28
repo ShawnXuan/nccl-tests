@@ -2,6 +2,21 @@
 
 These tests check both the performance and the correctness of [NCCL](http://github.com/nvidia/nccl) operations.
 
+The purpose of this fork is to eliminate the dependence on MPI(the world is suffering its arguments). The master node(proc=0) will write ncclid to nfs(where all the other nodes can access), all nodes will read a hosts file to determine node rank. `export NCCL_SOCKET_IFNAME=eno1` defines the interface name. 
+
+Example: run following command on every nodes simultaneously.
+```shell
+NCCL_SOCKET_IFNAME=eno1 ./build/all_reduce_perf -b 8M -e 128M -f 2 -g 8
+```
+
+hosts file
+```
+# hosts
+192.168.1.11
+192.168.1.12
+192.168.1.13
+192.168.1.14
+```
 ## Build
 
 To build the tests, just type `make`.
