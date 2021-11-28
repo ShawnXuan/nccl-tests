@@ -839,7 +839,6 @@ testResult_t run(); // Main function
 int main(int argc, char* argv[]) {
   // Make sure everyline is flushed so that we see the progress of the test
   setlinebuf(stdout);
-
   #if NCCL_VERSION_CODE >= NCCL_VERSION(2,4,0)
     ncclGetVersion(&test_ncclVersion);
   #else
@@ -1068,6 +1067,11 @@ void set_process(int* nnodes, int* node_rank) {
 testResult_t run() {
   int nProcs, proc;
   set_process(&nProcs, &proc);
+  printf("# nProcs: %d, proc: %d\n", nProcs, proc);
+  if(proc < 0) {
+    printf("This node is out of hosts");
+    exit(EXIT_SUCCESS);
+  }
 
   int localRank = 0;
   char hostname[1024];
@@ -1108,7 +1112,25 @@ testResult_t run() {
   ncclUniqueId ncclId;
   if (proc == 0) {
     NCCLCHECK(ncclGetUniqueId(&ncclId));
+    // save ncclId, nfs only
+    FILE *file = fopen("ncclid", "wb");
+    fwrite(ncclId.internal, sizeof(char), NCCL_UNIQUE_ID_BYTES, file);
+    fclose(file);
+  } else {
+    int c = 0;
+    while (access("ncclid", R_OK)){
+      ++c;
+      if(c > 60)
+        exit(EXIT_FAILURE);
+      printf("%d ncclid file doesn't exist, wait 10 more seconds.\n", c);
+      sleep(10);
+    }
+    // load ncclId, nfs only
+    FILE *file = fopen("ncclid", "rb");
+    fread(ncclId.internal, sizeof(char), NCCL_UNIQUE_ID_BYTES, file);
+    fclose(file);
   }
+
   cudaStream_t streams[nGpus*nThreads];
   void* sendbuffs[nGpus*nThreads];
   void* recvbuffs[nGpus*nThreads];
