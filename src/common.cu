@@ -11,6 +11,14 @@
 #include <libgen.h>
 #include "cuda.h"
 
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <ctype.h>
+
 int test_ncclVersion = 0; // init'd with ncclGetVersion()
 
 #if NCCL_MAJOR >= 2
@@ -386,9 +394,6 @@ void Barrier(struct threadArgs* args) {
   while (args->barrier[args->barrier_idx] != args->thread) pthread_yield();
   args->barrier[args->barrier_idx] = args->thread + 1;
   if (args->thread+1 == args->nThreads) {
-#ifdef MPI_SUPPORT
-    MPI_Barrier(MPI_COMM_WORLD);
-#endif
     args->barrier[args->barrier_idx] = 0;
   } else {
     while (args->barrier[args->barrier_idx]) pthread_yield();
@@ -409,12 +414,6 @@ void Allreduce(struct threadArgs* args, double* value, int average) {
   if (average || args->thread == 0) args->reduce[args->barrier_idx] = val;
   args->barrier[args->barrier_idx] = args->thread + 1;
   if (args->thread+1 == args->nThreads) {
-#ifdef MPI_SUPPORT
-    if (average != 0) {
-      MPI_Op op = average == 1 ? MPI_SUM : average == 2 ? MPI_MIN : MPI_MAX;
-      MPI_Allreduce(MPI_IN_PLACE, (void*)&args->reduce[args->barrier_idx], 1, MPI_DOUBLE, op, MPI_COMM_WORLD);
-    }
-#endif
     if (average == 1) args->reduce[args->barrier_idx] /= args->nProcs*args->nThreads;
     args->reduce[1-args->barrier_idx] = 0;
     args->barrier[args->barrier_idx] = 0;
@@ -840,7 +839,6 @@ testResult_t run(); // Main function
 int main(int argc, char* argv[]) {
   // Make sure everyline is flushed so that we see the progress of the test
   setlinebuf(stdout);
-
   #if NCCL_VERSION_CODE >= NCCL_VERSION(2,4,0)
     ncclGetVersion(&test_ncclVersion);
   #else
@@ -1001,30 +999,84 @@ int main(int argc, char* argv[]) {
            (unsigned long long)maxBytes);
     return -1;
   }
-#ifdef MPI_SUPPORT
-  MPI_Init(&argc, &argv);
-#endif
   TESTCHECK(run());
   return 0;
 }
 
+char *trim(char *s) {
+    char *ptr;
+    if (!s)
+        return NULL;   // handle NULL string
+    if (!*s)
+        return s;      // handle empty string
+    for (ptr = s + strlen(s) - 1; (ptr >= s) && isspace(*ptr); --ptr);
+    ptr[1] = '\0';
+    return s;
+}
+
+const char *get_ifname() {
+    const char* ifname = getenv("NCCL_SOCKET_IFNAME");
+    return ifname ? ifname : "lo";
+}
+
+void get_ip_addr(char* ip_address) {
+    int n;
+    struct ifreq ifr;
+    const char* ifname = get_ifname();
+    printf("interface name = %s\n", ifname);
+    n = socket(AF_INET, SOCK_DGRAM, 0);
+    //Type of address to retrieve - IPv4 IP address
+    ifr.ifr_addr.sa_family = AF_INET;
+    //Copy the interface name in the ifreq structure
+    strncpy(ifr.ifr_name , ifname , IFNAMSIZ - 1);
+    ioctl(n, SIOCGIFADDR, &ifr);
+    close(n);
+    strcpy(ip_address, inet_ntoa(((struct sockaddr_in*)&ifr.ifr_addr)->sin_addr));
+}
+
+void set_process(int* nnodes, int* node_rank) {
+  int nProcs = 0, proc = -1;
+  char ip_address[15];
+  FILE * fp;
+  char * line = NULL;
+  size_t len = 0;
+  ssize_t read;
+
+  get_ip_addr(ip_address);
+
+  fp = fopen("hosts", "r");
+  if (fp == NULL) {
+    printf("file `hosts` is needed");
+    exit(EXIT_FAILURE);
+  }
+
+  while ((read = getline(&line, &len, fp)) != -1) {
+    if (line[0] == '#')
+      continue;
+    if (strcmp(trim(line), ip_address) == 0)
+      proc = nProcs;
+    nProcs++;
+  }
+  *nnodes = nProcs;
+  *node_rank = proc;
+  fclose(fp);
+  if (line)
+    free(line);
+}
+
 testResult_t run() {
-  int nProcs = 1, proc = 0;
+  int nProcs, proc;
+  set_process(&nProcs, &proc);
+  printf("# nProcs: %d, proc: %d\n", nProcs, proc);
+  if(proc < 0) {
+    printf("This node is out of hosts");
+    exit(EXIT_SUCCESS);
+  }
+
   int localRank = 0;
   char hostname[1024];
   getHostName(hostname, 1024);
 
-#ifdef MPI_SUPPORT
-  MPI_Comm_size(MPI_COMM_WORLD, &nProcs);
-  MPI_Comm_rank(MPI_COMM_WORLD, &proc);
-  uint64_t hostHashs[nProcs];
-  hostHashs[proc] = getHostHash(hostname);
-  MPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, hostHashs, sizeof(uint64_t), MPI_BYTE, MPI_COMM_WORLD);
-  for (int p=0; p<nProcs; p++) {
-    if (p == proc) break;
-    if (hostHashs[p] == hostHashs[proc]) localRank++;
-  }
-#endif
   is_main_thread = (proc == 0) ? 1 : 0;
 
   PRINT("# nThread %d nGpus %d minBytes %ld maxBytes %ld step: %ld(%s) warmup iters: %d iters: %d validation: %d \n", nThreads, nGpus, minBytes, maxBytes,
@@ -1048,19 +1100,7 @@ testResult_t run() {
     maxMem = std::min(maxMem, prop.totalGlobalMem);
   }
 
-#if MPI_SUPPORT
-  char *lines = (proc == 0) ? (char *)malloc(nProcs*MAX_LINE) : NULL;
-  // Gather all output in rank order to root (0)
-  MPI_Gather(line, MAX_LINE, MPI_BYTE, lines, MAX_LINE, MPI_BYTE, 0, MPI_COMM_WORLD);
-  if (proc == 0) {
-    for (int p = 0; p < nProcs; p++)
-      PRINT("%s", lines+MAX_LINE*p);
-    free(lines);
-  }
-  MPI_Allreduce(MPI_IN_PLACE, &maxMem, 1, MPI_LONG, MPI_MIN, MPI_COMM_WORLD);
-#else
   PRINT("%s", line);
-#endif
 
   // We need sendbuff, recvbuff, expected (when datacheck enabled), plus 1G for the rest.
   size_t memMaxBytes = (maxMem - (1<<30)) / (datacheck ? 3 : 2);
@@ -1072,11 +1112,25 @@ testResult_t run() {
   ncclUniqueId ncclId;
   if (proc == 0) {
     NCCLCHECK(ncclGetUniqueId(&ncclId));
+    // save ncclId, nfs only
+    FILE *file = fopen("ncclid", "wb");
+    fwrite(ncclId.internal, sizeof(char), NCCL_UNIQUE_ID_BYTES, file);
+    fclose(file);
+  } else {
+    int c = 0;
+    while (access("ncclid", R_OK)){
+      ++c;
+      if(c > 60)
+        exit(EXIT_FAILURE);
+      printf("%d ncclid file doesn't exist, wait 10 more seconds.\n", c);
+      sleep(10);
+    }
+    // load ncclId, nfs only
+    FILE *file = fopen("ncclid", "rb");
+    fread(ncclId.internal, sizeof(char), NCCL_UNIQUE_ID_BYTES, file);
+    fclose(file);
   }
-#ifdef MPI_SUPPORT
-  MPI_Bcast(&ncclId, sizeof(ncclId), MPI_BYTE, 0, MPI_COMM_WORLD);
-  MPI_Barrier(MPI_COMM_WORLD);
-#endif
+
   cudaStream_t streams[nGpus*nThreads];
   void* sendbuffs[nGpus*nThreads];
   void* recvbuffs[nGpus*nThreads];
@@ -1177,10 +1231,6 @@ testResult_t run() {
     }
   }
 
-#ifdef MPI_SUPPORT
-  MPI_Allreduce(MPI_IN_PLACE, &errors[0], 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-#endif
-
   if (!parallel_init) {
     for(int i=0; i<nGpus*nThreads; ++i)
       NCCLCHECK(ncclCommDestroy(comms[i]));
@@ -1202,9 +1252,6 @@ testResult_t run() {
   PRINT("# Out of bounds values : %d %s\n", errors[0], errors[0] ? "FAILED" : "OK");
   PRINT("# Avg bus bandwidth    : %g %s\n", bw[0], check_avg_bw == -1 ? "" : (bw[0] < check_avg_bw*(0.9) ? "FAILED" : "OK"));
   PRINT("#\n");
-#ifdef MPI_SUPPORT
-  MPI_Finalize();
-#endif
 
   // 'cuda-memcheck --leak-check full' requires this
   cudaDeviceReset();
